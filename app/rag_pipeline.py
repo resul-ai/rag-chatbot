@@ -1,29 +1,40 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union, AsyncGenerator
+import logging
+from datetime import datetime
 from .vector_store import VectorStore
-from sentence_transformers import SentenceTransformer
-import json
-import time
+from .llm.base import BaseLLM, Message, LLMResponse
+from .llm.prompts import RAGPromptBuilder
+
+logger = logging.getLogger(__name__)
 
 class RAGPipeline:
-    def __init__(self, vector_store: VectorStore):
+    def __init__(self, vector_store: VectorStore, llm: BaseLLM):
         self.vector_store = vector_store
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.llm = llm
         
-    def generate_response(self, 
-                         query: str, 
-                         chat_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
-        """
-        Generate response using RAG pipeline
-        """
+    async def generate_response(self, 
+                              query: str,
+                              chat_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+        """Generate response using RAG pipeline"""
         try:
-            # Check if there are any documents in vector store
+            # Check vector store first
             if not self.vector_store.has_documents():
                 return {
-                    'status': 'error',
-                    'error': 'No documents available',
-                    'response': 'Please upload some documents first.',
+                    'status': 'success',  # error yerine success
+                    'response': 'I notice you haven\'t uploaded any documents yet. Please upload some documents so I can assist you better with specific information from them. In the meantime, is there anything else I can help you with?',
                     'sources': [],
-                    'timestamp': time.time()
+                    'timestamp': datetime.now().timestamp()
+                }
+
+            # Validate LLM connection
+            is_connected = await self.llm.validate_connection()
+            if not is_connected:
+                return {
+                    'status': 'error',
+                    'error': 'LLM service is not available',
+                    'response': 'The language model service is currently unavailable. Please try again later.',
+                    'sources': [],
+                    'timestamp': datetime.now().timestamp()
                 }
 
             # Get relevant documents
@@ -33,35 +44,72 @@ class RAGPipeline:
                 return {
                     'status': 'error',
                     'error': 'No relevant documents found',
-                    'response': 'I could not find any relevant information to answer your question.',
+                    'response': 'I could not find any relevant information in the documents to answer your question.',
                     'sources': [],
-                    'timestamp': time.time()
+                    'timestamp': datetime.now().timestamp()
                 }
 
-            # Format context from relevant documents
-            context = "\n".join([doc['text'] for doc in relevant_docs])
-            
-            # Format source information
-            sources = []
-            for doc in relevant_docs:
-                if doc['metadata']['filename'] not in sources:
-                    sources.append(doc['metadata']['filename'])
+            # Format context
+            context = "\n\n".join([
+                f"From {doc['metadata']['filename']}:\n{doc['text']}"
+                for doc in relevant_docs
+            ])
 
-            # For now, we'll return a simple response with context
-            response = {
-                'status': 'success',
-                'response': f"Based on the documents, here is what I found:\n\n{context}",
-                'sources': sources,
-                'timestamp': time.time()
-            }
-            
-            return response
+            # Convert chat history to Message objects if provided
+            history_messages = []
+            if chat_history:
+                for msg in chat_history:
+                    if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+                        history_messages.append(Message(
+                            role=msg['role'],
+                            content=msg['content']
+                        ))
+
+            # Build messages using RAGPromptBuilder
+            messages = RAGPromptBuilder.build_rag_messages(
+                question=query,
+                context=context,
+                chat_history=history_messages
+            )
+
+            # Get sources
+            sources = list(set(
+                doc['metadata']['filename'] 
+                for doc in relevant_docs
+            ))
+
+            try:
+                messages = RAGPromptBuilder.build_rag_messages(
+                question=query,
+                context=context,
+                chat_history=history_messages
+                )
+                # Get response from LLM with streaming enabled
+                response = await self.llm.chat(messages=messages, stream=True)
+
+                return {
+                        'status': 'success',
+                        'response': response,  # This is now an AsyncGenerator
+                        'sources': sources,
+                        'timestamp': datetime.now().timestamp()
+                        }
+                
+            except Exception as e:
+                logger.error(f"LLM error: {str(e)}")
+                return {
+                    'status': 'error',
+                    'error': f'LLM error: {str(e)}',
+                    'response': 'An error occurred while generating the response.',
+                    'sources': sources,
+                    'timestamp': datetime.now().timestamp()
+                }
 
         except Exception as e:
+            logger.error(f"RAG pipeline error: {str(e)}")
             return {
                 'status': 'error',
                 'error': str(e),
                 'response': 'An error occurred while processing your question.',
                 'sources': [],
-                'timestamp': time.time()
+                'timestamp': datetime.now().timestamp()
             }

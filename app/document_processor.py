@@ -1,9 +1,11 @@
-import os
 from typing import List, Optional, Dict, Any
 import PyPDF2
 from docx import Document
-from .utils import TextProcessor
+from .text_processor import TextProcessor
 from .vector_store import VectorStore
+import logging
+
+logger = logging.getLogger(__name__)
 
 class DocumentProcessor:
     def __init__(self):
@@ -13,16 +15,16 @@ class DocumentProcessor:
             'doc': self._process_doc,
             'docx': self._process_doc
         }
-        self.text_processor = TextProcessor()
+        self.text_processor = TextProcessor()  # default max_tokens=768 ile
         self.vector_store = VectorStore()
         
-        # Try to load existing vector store
+        # Load existing vector store if available
         self.vector_store.load()
 
     def process_document(self, file, file_type: str) -> Dict[str, Any]:
-        """Process the uploaded document and add to vector store"""
+        """Process document and add to vector store"""
         try:
-            # Extract text from document
+            # Validate file type
             if file_type.lower() not in self.supported_formats:
                 return {
                     'status': 'error',
@@ -30,6 +32,7 @@ class DocumentProcessor:
                     'metadata': {'filename': file.name}
                 }
 
+            # Extract text
             text = self.supported_formats[file_type.lower()](file)
             
             if not text:
@@ -46,14 +49,18 @@ class DocumentProcessor:
                 'file_size': file.size
             }
             
-            # Split text into chunks
+            # Process text into chunks - using enhanced TextProcessor
             chunks = self.text_processor.split_into_chunks(text)
+            
+            if not chunks:
+                return {
+                    'status': 'error',
+                    'error': 'No valid text chunks could be extracted',
+                    'metadata': metadata
+                }
             
             # Add to vector store
             self.vector_store.add_documents(chunks, metadata)
-            
-            # Save updated vector store
-            self.vector_store.save()
             
             return {
                 'status': 'success',
@@ -62,6 +69,7 @@ class DocumentProcessor:
             }
             
         except Exception as e:
+            logger.error(f"Error processing document: {str(e)}")
             return {
                 'status': 'error',
                 'error': str(e),
@@ -73,7 +81,7 @@ class DocumentProcessor:
         try:
             return file.read().decode('utf-8')
         except Exception as e:
-            print(f"Error processing TXT: {str(e)}")
+            logger.error(f"Error processing TXT: {str(e)}")
             return ""
 
     def _process_pdf(self, file) -> str:
@@ -82,10 +90,10 @@ class DocumentProcessor:
             pdf_reader = PyPDF2.PdfReader(file)
             text = ""
             for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
+                text += page.extract_text() + "\f"  # Add form feed character to mark page breaks
             return text
         except Exception as e:
-            print(f"Error processing PDF: {str(e)}")
+            logger.error(f"Error processing PDF: {str(e)}")
             return ""
 
     def _process_doc(self, file) -> str:
@@ -97,5 +105,5 @@ class DocumentProcessor:
                 text += paragraph.text + "\n"
             return text
         except Exception as e:
-            print(f"Error processing DOC: {str(e)}")
+            logger.error(f"Error processing DOC: {str(e)}")
             return ""

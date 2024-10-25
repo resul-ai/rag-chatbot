@@ -1,28 +1,86 @@
 import streamlit as st
+import os
+import asyncio
+import logging
+from datetime import datetime
+from typing import Optional, Dict, Any
+from asyncio import AbstractEventLoop
+from typing import AsyncGenerator
+
 from app.document_processor import DocumentProcessor
+from app.llm.base import LLMResponse
 from app.rag_pipeline import RAGPipeline
 from app.chat_manager import ChatManager
 from app.database import Database
-import os
-from datetime import datetime
+from app.llm.ollama_llm import OllamaLLM
 
-def check_file_size(file):
-    """Check if file size is less than 5MB"""
-    MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB in bytes
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Constants
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+SUPPORTED_TYPES = ["txt", "pdf", "doc", "docx"]
+
+def check_file_size(file) -> bool:
+    """Check if file size is less than MAX_FILE_SIZE"""
     return file.size <= MAX_FILE_SIZE
 
-def format_timestamp(timestamp):
+def format_timestamp(timestamp: float) -> str:
     """Format timestamp for display"""
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+async def init_llm() -> OllamaLLM:
+    """Initialize and validate LLM connection"""
+    llm = OllamaLLM(
+        model=os.getenv("OLLAMA_MODEL", "llama3.2"),
+        host=os.getenv("OLLAMA_HOST", "http://ollama:11434")
+    )
+    
+    for i in range(3):
+        try:
+            is_connected = await llm.validate_connection()
+            if is_connected:
+                logger.info("Successfully connected to Ollama")
+                return llm
+            logger.warning(f"Attempt {i+1}: Failed to connect to Ollama, retrying...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Connection attempt {i+1} failed: {str(e)}")
+            if i < 2:
+                await asyncio.sleep(5)
+    
+    logger.error("Failed to connect to Ollama after multiple attempts")
+    return llm
+
+def get_async_loop() -> AbstractEventLoop:
+    """Get or create an event loop"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop
 
 def initialize_session_state():
     """Initialize session state variables"""
     if 'document_processor' not in st.session_state:
         st.session_state.document_processor = DocumentProcessor()
     
+    if 'llm' not in st.session_state:
+        loop = get_async_loop()
+        st.session_state.llm = loop.run_until_complete(init_llm())
+        
     if 'rag_pipeline' not in st.session_state:
         st.session_state.rag_pipeline = RAGPipeline(
-            st.session_state.document_processor.vector_store
+            vector_store=st.session_state.document_processor.vector_store,
+            llm=st.session_state.llm
         )
     
     if 'chat_manager' not in st.session_state:
@@ -32,10 +90,43 @@ def initialize_session_state():
         st.session_state.database = Database()
     
     if 'current_chat_id' not in st.session_state:
-        st.session_state.current_chat_id = "default"
+        st.session_state.current_chat_id = st.session_state.chat_manager.create_session()
     
     if 'active_files' not in st.session_state:
         st.session_state.active_files = {}
+    
+    if 'file_to_remove' not in st.session_state:
+        st.session_state.file_to_remove = {}
+
+def remove_file(file_id: str):
+    """Remove file from vector store"""
+    try:
+        if file_id in st.session_state.file_to_remove:
+            filename = st.session_state.file_to_remove[file_id]
+            vector_store = st.session_state.document_processor.vector_store
+            
+            if vector_store.remove_document(file_id):
+                # Update session state
+                st.session_state.active_files = {
+                    k: v for k, v in st.session_state.active_files.items()
+                    if k != file_id
+                }
+                st.session_state.file_to_remove = {
+                    k: v for k, v in st.session_state.file_to_remove.items()
+                    if k != file_id
+                }
+                
+                # Save vector store
+                vector_store.save()
+                
+                # Clear chat if no documents remain
+                if not vector_store.has_documents():
+                    clear_current_chat()
+                    create_new_chat()
+                    
+    except Exception as e:
+        logger.error(f"Error removing file: {str(e)}")
+        st.error(f"Error removing file: {str(e)}")
 
 def create_new_chat():
     """Create new chat and update session state"""
@@ -48,108 +139,41 @@ def clear_current_chat():
     if st.session_state.database and st.session_state.current_chat_id:
         st.session_state.database.clear_chat_history(st.session_state.current_chat_id)
 
-def remove_file(file_id: str):
-    """Remove file from vector store"""
-    if file_id in st.session_state.get('file_to_remove', {}):
-        filename = st.session_state.file_to_remove[file_id]
-        vector_store = st.session_state.document_processor.vector_store
-        
-        if vector_store.remove_document(file_id):
-            if file_id in st.session_state.active_files:
-                del st.session_state.active_files[file_id]
-            vector_store.save()
-            
-            # Clear chat history when all documents are removed
-            if not vector_store.has_documents():
-                clear_current_chat()
-                create_new_chat()
+def process_stream_response(response_stream: AsyncGenerator) -> str:
+    """Process streaming response"""
+    loop = get_async_loop()
+    full_response = ""
+    
+    async def collect_stream():
+        nonlocal full_response
+        async for chunk in response_stream:
+            if hasattr(chunk, 'content'):
+                full_response += chunk.content
+                yield full_response
+    
+    try:
+        return loop.run_until_complete(collect_stream())
+    except Exception as e:
+        logger.error(f"Error processing stream: {str(e)}")
+        return ""
 
-def main():
-    st.set_page_config(
-        page_title="RAG Chatbot",
-        page_icon="🤖",
-        layout="wide"
-    )
+async def process_query(pipeline: RAGPipeline, 
+                       query: str, 
+                       chat_history: list) -> Dict[str, Any]:
+    """Process query using RAG pipeline"""
+    try:
+        return await pipeline.generate_response(query, chat_history)
+    except Exception as e:
+        logger.error(f"Error processing query: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e),
+            'response': 'An error occurred while processing your question.',
+            'sources': [],
+            'timestamp': datetime.now().timestamp()
+        }
 
-    # Initialize session state
-    initialize_session_state()
-
-    # Create sidebar
-    with st.sidebar:
-        st.title("📚 Document Management")
-        
-        # File uploader
-        uploaded_files = st.file_uploader(
-            "Upload Documents (max 5 files, each under 5MB)", 
-            type=["txt", "pdf", "doc", "docx"],
-            accept_multiple_files=True
-        )
-        
-        # New chat and Clear chat buttons
-        col1, col2 = st.columns(2)
-        with col1:
-            st.button("🆕 New Chat", key="new_chat", on_click=create_new_chat)
-        with col2:
-            st.button("🗑️ Clear Chat", key="clear_chat", on_click=clear_current_chat)
-        
-        # Show active documents
-        st.write("---")
-        st.write("📁 Active Documents:")
-        
-        # Get document info from vector store
-        vector_store = st.session_state.document_processor.vector_store
-        doc_info = vector_store.get_document_info()
-        
-        if not doc_info:
-            st.write("No documents loaded")
-        else:
-            for doc in doc_info:
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.write(f"📄 {doc['filename']}")
-                    st.caption(f"Chunks: {doc['chunk_count']}")
-                with col2:
-                    # Store file info in session state for removal
-                    st.session_state.file_to_remove = {
-                        doc['file_id']: doc['filename']
-                    }
-                    st.button(
-                        "🗑️",
-                        key=f"remove_{doc['file_id']}",
-                        on_click=remove_file,
-                        args=(doc['file_id'],)
-                    )
-        
-        # Process new uploads
-        if uploaded_files:
-            st.write("---")
-            st.write("📤 Processing Uploads:")
-            
-            for uploaded_file in uploaded_files:
-                if not check_file_size(uploaded_file):
-                    st.error(f"❌ {uploaded_file.name} (Too large)")
-                    continue
-                
-                # Process the file
-                try:
-                    file_extension = uploaded_file.name.split('.')[-1].lower()
-                    result = st.session_state.document_processor.process_document(
-                        uploaded_file,
-                        file_extension
-                    )
-                    
-                    if result.get('status') == 'success':
-                        st.success(f"✅ {uploaded_file.name}")
-                        st.caption(f"Chunks: {result.get('chunks', 0)}")
-                    else:
-                        st.error(f"❌ {uploaded_file.name}")
-                        st.caption(f"Error: {result.get('error', 'Unknown error')}")
-                
-                except Exception as e:
-                    st.error(f"❌ {uploaded_file.name}")
-                    st.caption(f"Error: {str(e)}")
-
-    # Main chat interface
+def render_chat_interface():
     st.title("🤖 RAG Chatbot")
     
     # Get chat history
@@ -172,24 +196,139 @@ def main():
             st.write(query)
         
         with st.chat_message("assistant"):
-            response = st.session_state.rag_pipeline.generate_response(
-                query,
-                chat_history
-            )
-            
-            if response['status'] == 'success':
-                st.write(response['response'])
-                if response.get('sources'):
-                    st.caption(f"Sources: {', '.join(response['sources'])}")
-                
-                # Save to database
-                st.session_state.database.save_chat_message(
-                    st.session_state.current_chat_id,
+            placeholder = st.empty()
+            full_response = ""
+
+            async def generate_response():
+                nonlocal full_response
+                response = await process_query(
+                    st.session_state.rag_pipeline,
                     query,
-                    response
+                    chat_history
                 )
-            else:
-                st.error(response.get('error', 'An error occurred'))
+                
+                if response['status'] == 'success':
+                    if isinstance(response['response'], AsyncGenerator):
+                        async for chunk in response['response']:
+                            if isinstance(chunk, LLMResponse):
+                                full_response += chunk.content
+                                # Streamlit'in stream yazma özelliğini kullanalım
+                                placeholder.markdown(full_response)
+                                await asyncio.sleep(0.005) 
+                    else:
+                        full_response = response['response']
+                        placeholder.markdown(full_response)
+
+                    if response.get('sources'):
+                        st.caption(f"Sources: {', '.join(response['sources'])}")
+                    
+                    # Save to database
+                    st.session_state.database.save_chat_message(
+                        st.session_state.current_chat_id,
+                        query,
+                        {
+                            'response': full_response,
+                            'sources': response.get('sources', []),
+                            'timestamp': response['timestamp']
+                        }
+                    )
+                else:
+                    st.error(response.get('error', 'An error occurred'))
+
+            # Run the async function
+            loop = get_async_loop()
+            loop.run_until_complete(generate_response())
+
+def render_sidebar():
+    """Render sidebar content"""
+    with st.sidebar:
+        st.title("📚 Document Management")
+        
+        # File uploader
+        uploaded_files = st.file_uploader(
+            "Upload Documents", 
+            type=SUPPORTED_TYPES,
+            accept_multiple_files=True
+        )
+        
+        # New chat and Clear chat buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            st.button("🆕 New Chat", key="new_chat", on_click=create_new_chat)
+        with col2:
+            st.button("🗑️ Clear Chat", key="clear_chat", on_click=clear_current_chat)
+        
+        # Show active documents
+        st.write("---")
+        st.write("📁 Active Documents:")
+        
+        vector_store = st.session_state.document_processor.vector_store
+        doc_info = vector_store.get_document_info()
+        
+        if not doc_info:
+            st.write("No documents loaded")
+        else:
+            for doc in doc_info:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.write(f"📄 {doc['filename']}")
+                    st.caption(f"Chunks: {doc['chunk_count']}")
+                with col2:
+                    st.session_state.file_to_remove = {
+                        doc['file_id']: doc['filename']
+                    }
+                    st.button(
+                        "🗑️",
+                        key=f"remove_{doc['file_id']}",
+                        on_click=remove_file,
+                        args=(doc['file_id'],)
+                    )
+        
+        # Process uploads
+        if uploaded_files:
+            st.write("---")
+            st.write("📤 Processing Uploads:")
+            
+            for uploaded_file in uploaded_files:
+                if not check_file_size(uploaded_file):
+                    st.error(f"❌ {uploaded_file.name} (Too large)")
+                    continue
+                
+                try:
+                    file_extension = uploaded_file.name.split('.')[-1].lower()
+                    result = st.session_state.document_processor.process_document(
+                        uploaded_file,
+                        file_extension
+                    )
+                    
+                    if result['status'] == 'success':
+                        st.success(f"✅ {uploaded_file.name}")
+                        st.caption(f"Chunks: {result['chunks']}")
+                    else:
+                        st.error(f"❌ {uploaded_file.name}")
+                        st.caption(f"Error: {result['error']}")
+                
+                except Exception as e:
+                    logger.error(f"Error processing file {uploaded_file.name}: {str(e)}")
+                    st.error(f"❌ {uploaded_file.name}")
+                    st.caption(f"Error: {str(e)}")
+
+def main():
+    """Main application entry point"""
+    try:
+        st.set_page_config(
+            page_title="RAG Chatbot",
+            page_icon="🤖",
+            layout="wide"
+        )
+
+        initialize_session_state()
+        render_sidebar()
+        render_chat_interface()
+
+    except Exception as e:
+        logger.error(f"Application error: {str(e)}")
+        st.error("An error occurred. Please refresh the page and try again.")
 
 if __name__ == "__main__":
     main()
