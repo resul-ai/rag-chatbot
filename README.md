@@ -52,7 +52,7 @@ A Retrieval-Augmented Generation (RAG) chatbot application that enables document
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/rag-chatbot.git
+git clone https://github.com/russell-ai/rag-chatbot.git
 cd rag-chatbot
 ```
 
