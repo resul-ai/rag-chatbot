@@ -12,3 +12,4 @@ openai==1.52.2
 pydantic==2.9.2
 nltk==3.9.1
 tenacity==9.0.0
+redis==5.2.0

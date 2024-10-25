@@ -94,36 +94,27 @@ def initialize_session_state():
     
     if 'active_files' not in st.session_state:
         st.session_state.active_files = {}
-    
-    if 'file_to_remove' not in st.session_state:
-        st.session_state.file_to_remove = {}
+
 
 def remove_file(file_id: str):
     """Remove file from vector store"""
     try:
-        if file_id in st.session_state.file_to_remove:
-            filename = st.session_state.file_to_remove[file_id]
-            vector_store = st.session_state.document_processor.vector_store
+        vector_store = st.session_state.document_processor.vector_store
+        if vector_store.remove_document(file_id):
+            # Update session state
+            st.session_state.active_files = {
+                k: v for k, v in st.session_state.active_files.items()
+                if k != file_id
+            }
             
-            if vector_store.remove_document(file_id):
-                # Update session state
-                st.session_state.active_files = {
-                    k: v for k, v in st.session_state.active_files.items()
-                    if k != file_id
-                }
-                st.session_state.file_to_remove = {
-                    k: v for k, v in st.session_state.file_to_remove.items()
-                    if k != file_id
-                }
-                
-                # Save vector store
-                vector_store.save()
-                
-                # Clear chat if no documents remain
-                if not vector_store.has_documents():
-                    clear_current_chat()
-                    create_new_chat()
-                    
+            # Clear chat if no documents remain
+            if not vector_store.has_documents():
+                clear_current_chat()
+                create_new_chat()
+            
+            # Force sidebar refresh
+            st.rerun()
+            
     except Exception as e:
         logger.error(f"Error removing file: {str(e)}")
         st.error(f"Error removing file: {str(e)}")
@@ -248,7 +239,8 @@ def render_sidebar():
         uploaded_files = st.file_uploader(
             "Upload Documents", 
             type=SUPPORTED_TYPES,
-            accept_multiple_files=True
+            accept_multiple_files=True,
+            key="file_uploader"  # Unique key eklendi
         )
         
         # New chat and Clear chat buttons
@@ -262,27 +254,45 @@ def render_sidebar():
         st.write("---")
         st.write("📁 Active Documents:")
         
+        if 'document_processor' not in st.session_state:
+            return
+
         vector_store = st.session_state.document_processor.vector_store
         doc_info = vector_store.get_document_info()
         
+        # Initialize active_files in session state if not exists
+        if 'active_files' not in st.session_state:
+            st.session_state.active_files = {}
+
         if not doc_info:
             st.write("No documents loaded")
         else:
-            for doc in doc_info:
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.write(f"📄 {doc['filename']}")
-                    st.caption(f"Chunks: {doc['chunk_count']}")
-                with col2:
-                    st.session_state.file_to_remove = {
-                        doc['file_id']: doc['filename']
-                    }
-                    st.button(
-                        "🗑️",
-                        key=f"remove_{doc['file_id']}",
-                        on_click=remove_file,
-                        args=(doc['file_id'],)
-                    )
+            # Create a container for document list
+            doc_container = st.container()
+            
+            with doc_container:
+                for doc in doc_info:
+                    file_id = doc['file_id']
+                    
+                    # Skip if already in active_files
+                    if file_id in st.session_state.active_files:
+                        continue
+                        
+                    # Add to active_files
+                    st.session_state.active_files[file_id] = doc['filename']
+                    
+                # Display active files from session state
+                for file_id, filename in st.session_state.active_files.items():
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.write(f"📄 {filename}")
+                        doc_data = next((d for d in doc_info if d['file_id'] == file_id), None)
+                        if doc_data:
+                            st.caption(f"Chunks: {doc_data['chunk_count']}")
+                    with col2:
+                        # Use unique key for each delete button
+                        if st.button("🗑️", key=f"remove_{file_id}", help="Remove document"):
+                            remove_file(file_id)
         
         # Process uploads
         if uploaded_files:
@@ -290,6 +300,10 @@ def render_sidebar():
             st.write("📤 Processing Uploads:")
             
             for uploaded_file in uploaded_files:
+                if uploaded_file.name in [v for v in st.session_state.active_files.values()]:
+                    st.warning(f"⚠️ {uploaded_file.name} already exists")
+                    continue
+                    
                 if not check_file_size(uploaded_file):
                     st.error(f"❌ {uploaded_file.name} (Too large)")
                     continue
@@ -304,6 +318,8 @@ def render_sidebar():
                     if result['status'] == 'success':
                         st.success(f"✅ {uploaded_file.name}")
                         st.caption(f"Chunks: {result['chunks']}")
+                        # Force sidebar refresh after successful upload
+                        st.rerun()
                     else:
                         st.error(f"❌ {uploaded_file.name}")
                         st.caption(f"Error: {result['error']}")

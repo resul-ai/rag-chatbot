@@ -11,9 +11,12 @@ services:
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_MODEL=llama3.2
+      - REDIS_URL=redis://redis:6379
       - DEBUG=true
     depends_on:
       ollama:
+        condition: service_started
+      redis:
         condition: service_started
     networks:
       - rag-network
@@ -27,6 +30,16 @@ services:
     networks:
       - rag-network
 
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - rag-network
+    command: redis-server --save 60 1 --loglevel warning
+
 networks:
   rag-network:
     driver: bridge
@@ -36,3 +49,5 @@ volumes:
     name: ollama_models
   app_data:
     name: rag_app_data
+  redis_data:
+    name: rag_redis_data
