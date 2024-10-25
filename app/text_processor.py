@@ -1,6 +1,6 @@
-from typing import List, Optional
+from typing import List
 import nltk
-from nltk.tokenize import sent_tokenize
+from nltk.tokenize import sent_tokenize, word_tokenize
 import re
 import logging
 
@@ -8,41 +8,50 @@ logger = logging.getLogger(__name__)
 
 class TextProcessor:
     """
-    A text processor that hierarchically splits text into chunks while preserving context.
-    Follows a hierarchy of: pages -> paragraphs -> sentences -> token-based splits.
-    Ensures no chunk exceeds the specified maximum token limit.
+    A text processor that splits text into chunks while preserving sentence integrity.
+    Uses NLTK for sentence and word tokenization.
     """
     
     def __init__(self, max_tokens: int = 768):
         """
         Initialize TextProcessor with maximum tokens per chunk.
-        Downloads required NLTK data if not already present.
+        Downloads required NLTK data if not present.
         
         Args:
-            max_tokens (int): Maximum number of tokens per chunk (default: 768)
+            max_tokens (int): Maximum number of tokens per chunk
         """
         self.max_tokens = max_tokens
-        # Download required NLTK data
-        try:
-            nltk.data.find('tokenizers/punkt')
-        except LookupError:
-            logger.info("Downloading NLTK punkt tokenizer...")
-            nltk.download('punkt', quiet=True)
-            nltk.download('averaged_perceptron_tagger', quiet=True)
         
-        # Ensure language-specific resources are available
-        try:
-            nltk.data.find('tokenizers/punkt/PY3/english.pickle')
-        except LookupError:
-            logger.info("Downloading English language model...")
-            nltk.download('punkt', quiet=True)
+        # Download all required NLTK data
+        requirements = [
+            'punkt',
+            'averaged_perceptron_tagger',
+            'punkt_tab',
+            'english.pickle'
+        ]
+        
+        for requirement in requirements:
+            try:
+                # Special handling for english.pickle
+                if requirement == 'english.pickle':
+                    try:
+                        nltk.data.find('tokenizers/punkt/english.pickle')
+                    except LookupError:
+                        nltk.download('punkt')
+                else:
+                    try:
+                        nltk.data.find(f'tokenizers/{requirement}')
+                    except LookupError:
+                        nltk.download(requirement, quiet=True)
+            except Exception as e:
+                logger.warning(f"Failed to download {requirement}: {str(e)}")
     
     def split_into_chunks(self, text: str) -> List[str]:
         """
-        Split text into chunks hierarchically while preserving context.
+        Split text into chunks while preserving sentence integrity.
         
         Args:
-            text (str): Input text to be split
+            text (str): Input text to split
             
         Returns:
             List[str]: List of text chunks
@@ -50,227 +59,158 @@ class TextProcessor:
         if not text or not text.strip():
             return []
             
-        # Basic cleaning (minimal)
         text = self._basic_clean(text)
         
-        # Check for page breaks (form feed character)
+        # Handle page breaks first
         if '\f' in text:
             pages = text.split('\f')
             chunks = []
             for page in pages:
-                if page.strip():  # Skip empty pages
-                    if self._estimate_tokens(page) <= self.max_tokens:
-                        chunks.append(page.strip())
-                    else:
-                        # Split page into smaller chunks
-                        chunks.extend(self._split_large_text(page))
+                if page.strip():
+                    chunks.extend(self._process_text(page))
             return chunks
-            
-        return self._split_large_text(text)
+        
+        return self._process_text(text)
     
     def _basic_clean(self, text: str) -> str:
         """
-        Perform minimal text cleaning without losing content.
-        
-        Args:
-            text (str): Text to clean
-            
-        Returns:
-            str: Cleaned text
+        Perform basic text cleaning.
         """
-        # Normalize line endings
         text = text.replace('\r\n', '\n').replace('\r', '\n')
-        # Reduce multiple consecutive newlines to double newlines
         text = re.sub(r'\n{3,}', '\n\n', text)
-        # Remove leading/trailing whitespace from lines while preserving paragraphs
-        lines = [line.strip() for line in text.splitlines()]
-        return '\n'.join(line for line in lines)
+        return text.strip()
     
-    def _split_large_text(self, text: str) -> List[str]:
+    def _process_text(self, text: str) -> List[str]:
         """
-        Split large text into smaller chunks by paragraphs first.
+        Process text by splitting into paragraphs first, then sentences.
+        """
+        # Split into paragraphs
+        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
         
-        Args:
-            text (str): Text to split
+        if not paragraphs:
+            return []
             
-        Returns:
-            List[str]: List of text chunks
-        """
-        paragraphs = self._split_into_paragraphs(text)
         chunks = []
-        current_chunk = ""
+        current_chunk = []
+        current_tokens = 0
         
-        for para in paragraphs:
-            if not para.strip():
-                continue
+        for paragraph in paragraphs:
+            # Get sentences in paragraph
+            try:
+                sentences = sent_tokenize(paragraph)
+            except Exception as e:
+                logger.warning(f"NLTK sentence tokenization failed: {str(e)}")
+                # Fallback to simple sentence splitting
+                sentences = [s.strip() + '.' for s in paragraph.split('.') if s.strip()]
+            
+            paragraph_processed = False
+            
+            for sentence in sentences:
+                # Count tokens in sentence
+                try:
+                    sentence_tokens = word_tokenize(sentence)
+                except Exception as e:
+                    logger.warning(f"NLTK word tokenization failed: {str(e)}")
+                    sentence_tokens = sentence.split()
                 
-            # If paragraph alone exceeds limit
-            if self._estimate_tokens(para) > self.max_tokens:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = ""
-                # Split paragraph into sentences
-                chunks.extend(self._split_paragraph(para))
-            else:
-                if current_chunk and self._estimate_tokens(current_chunk + "\n" + para) > self.max_tokens:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = para
+                sentence_token_count = len(sentence_tokens)
+                
+                # If single sentence exceeds max tokens
+                if sentence_token_count > self.max_tokens:
+                    # Save current chunk if exists
+                    if current_chunk:
+                        chunks.append(' '.join(current_chunk))
+                        current_chunk = []
+                        current_tokens = 0
+                    
+                    # Add long sentence as its own chunk
+                    chunks.append(sentence)
+                    paragraph_processed = True
+                    continue
+                
+                # If adding this sentence would exceed the limit
+                if current_tokens + sentence_token_count > self.max_tokens:
+                    # Save current chunk
+                    chunks.append(' '.join(current_chunk))
+                    # Start new chunk with current sentence
+                    current_chunk = [sentence]
+                    current_tokens = sentence_token_count
                 else:
-                    current_chunk = (current_chunk + "\n" + para if current_chunk else para)
+                    # Add sentence to current chunk
+                    current_chunk.append(sentence)
+                    current_tokens += sentence_token_count
+                
+                paragraph_processed = True
+            
+            # Add paragraph break if not at the end
+            if paragraph_processed and current_chunk and paragraphs.index(paragraph) < len(paragraphs) - 1:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = []
+                current_tokens = 0
         
+        # Add final chunk if exists
         if current_chunk:
-            chunks.append(current_chunk.strip())
+            chunks.append(' '.join(current_chunk))
         
-        return [c for c in chunks if c.strip()]
-    
-    def _split_into_paragraphs(self, text: str) -> List[str]:
-        """
-        Split text into paragraphs using blank lines as separators.
-        
-        Args:
-            text (str): Text to split into paragraphs
-            
-        Returns:
-            List[str]: List of paragraphs
-        """
-        return [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-    
-    def _split_paragraph(self, paragraph: str) -> List[str]:
-        """
-        Split paragraph into smaller chunks by sentences.
-        If NLTK sentence tokenization fails, falls back to simple splitting.
-        
-        Args:
-            paragraph (str): Paragraph to split
-            
-        Returns:
-            List[str]: List of chunks
-        """
-        try:
-            sentences = sent_tokenize(paragraph)
-        except Exception as e:
-            logger.warning(f"NLTK sentence tokenization failed: {str(e)}")
-            # Fallback to simple sentence splitting
-            sentences = [s.strip() + '.' for s in paragraph.split('.') if s.strip()]
-        
-        chunks = []
-        current_chunk = ""
-        
-        for sentence in sentences:
-            # If single sentence exceeds limit
-            if self._estimate_tokens(sentence) > self.max_tokens:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = ""
-                # Split sentence by token limit
-                chunks.extend(self._split_by_tokens(sentence))
-            else:
-                if current_chunk and self._estimate_tokens(current_chunk + " " + sentence) > self.max_tokens:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = sentence
-                else:
-                    current_chunk = (current_chunk + " " + sentence if current_chunk else sentence)
-        
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        
-        return [c for c in chunks if c.strip()]
-    
-    def _split_by_tokens(self, text: str) -> List[str]:
-        """
-        Split text by estimated token count while trying to preserve word boundaries.
-        
-        Args:
-            text (str): Text to split
-            
-        Returns:
-            List[str]: List of chunks
-        """
-        words = text.split()
-        chunks = []
-        current_chunk = ""
-        
-        for word in words:
-            if self._estimate_tokens(current_chunk + " " + word) > self.max_tokens:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = word
-            else:
-                current_chunk = (current_chunk + " " + word if current_chunk else word)
-        
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        
-        return [c for c in chunks if c.strip()]
-    
-    def _estimate_tokens(self, text: str) -> int:
-        """
-        Estimate the number of tokens in text.
-        Uses a simple approximation: ~4 characters per token.
-        
-        Args:
-            text (str): Text to estimate tokens for
-            
-        Returns:
-            int: Estimated number of tokens
-        """
-        return len(text.strip()) // 4 + 1  # +1 for safety margin
+        return [chunk.strip() for chunk in chunks if chunk.strip()]
 
 
 if __name__ == "__main__":
-    # Test examples
-    processor = TextProcessor(max_tokens=20)  # Small token limit for testing
+    # Configure logging
+    logging.basicConfig(level=logging.INFO)
     
-    print("Initializing text processor and downloading required NLTK data...")
+    processor = TextProcessor(max_tokens=50)  # Small token limit for testing
     
-    # Test 1: Page-based splitting (PDF-like content)
-    print("\nTest 1: Page-based splitting")
-    pdf_like_text = "Page 1 content.\nMore content here.\f\nPage 2 content.\nExtra content.\f\nPage 3."
-    chunks = processor.split_into_chunks(pdf_like_text)
-    print(f"Input length: {len(pdf_like_text)}")
-    for i, chunk in enumerate(chunks, 1):
-        print(f"Chunk {i}: {chunk}")
+    print("Running text processor tests...\n")
     
-    # Test 2: Paragraph-based splitting
-    print("\nTest 2: Paragraph-based splitting")
-    paragraphs = """First paragraph with enough text to demonstrate splitting.
+    def test_and_print(name: str, text: str):
+        print(f"\n=== Test: {name} ===")
+        try:
+            token_count = len(word_tokenize(text)) if text.strip() else 0
+            print(f"Input text ({token_count} tokens):")
+        except Exception:
+            print(f"Input text (token count unavailable):")
+        print(text[:100] + "..." if len(text) > 100 else text)
+        
+        chunks = processor.split_into_chunks(text)
+        print(f"\nNumber of chunks: {len(chunks)}")
+        
+        for i, chunk in enumerate(chunks, 1):
+            try:
+                chunk_tokens = len(word_tokenize(chunk))
+                print(f"\nChunk {i} ({chunk_tokens} tokens):")
+            except Exception:
+                print(f"\nChunk {i} (token count unavailable):")
+            print(chunk)
     
-    Second paragraph that contains multiple sentences. This is another sentence.
+    # Test cases
     
-    Third small paragraph."""
-    chunks = processor.split_into_chunks(paragraphs)
-    for i, chunk in enumerate(chunks, 1):
-        print(f"Chunk {i}: {chunk}")
+    # Test 1: Normal paragraphs
+    test_and_print("Normal Paragraphs", """
+    First paragraph with regular content that should be processed normally.
     
-    # Test 3: Long sentence splitting
-    print("\nTest 3: Long sentence splitting")
-    long_sentence = "This is an extremely long sentence that contains many words and should be split into multiple chunks because it exceeds our token limit and needs to be handled properly by the processor while maintaining as much coherence as possible."
-    chunks = processor.split_into_chunks(long_sentence)
-    for i, chunk in enumerate(chunks, 1):
-        print(f"Chunk {i}: {chunk}")
+    Second paragraph with some more content. This paragraph has multiple sentences. Each sentence should be properly handled.
     
-    # Test 4: Mixed content
-    print("\nTest 4: Mixed content")
-    mixed_text = """Short paragraph.
-
-    A longer paragraph with multiple sentences. This should be split carefully.
+    Third small paragraph with just one sentence.
+    """)
     
-    Final short line."""
-    chunks = processor.split_into_chunks(mixed_text)
-    for i, chunk in enumerate(chunks, 1):
-        print(f"Chunk {i}: {chunk}")
+    # Test 2: Long continuous text
+    test_and_print("Long Continuous", "This is a very long sentence. " * 20)
     
-    # Test 5: Edge cases
-    print("\nTest 5: Edge cases")
-    edge_cases = [
-        "",  # Empty string
-        "Short text",  # Text below limit
-        "a" * 2000,  # Very long string without spaces
-        "\n\n\n",  # Only newlines
-        "   ",  # Only spaces
-    ]
+    # Test 3: Text with page breaks
+    test_and_print("Page Breaks", 
+        "Page 1 has this content. Another sentence here.\f\n" + 
+        "Page 2 starts here. It continues with more text.\f\n" + 
+        "Page 3 is short.")
     
-    for case in edge_cases:
-        print(f"\nInput: '{case}'")
-        chunks = processor.split_into_chunks(case)
-        print(f"Chunks: {chunks}")
+    # Test 4: Very long word sequence
+    test_and_print("Long Word", "supercalifragilisticexpialidocious " * 30)
+    
+    # Test 5: Mixed content with varying sentence lengths
+    test_and_print("Mixed Content", """
+    Short sentence here. Another short one.
+    
+    This is a much longer sentence that contains many more words and should probably be in its own chunk because it exceeds our token limit. This is a shorter follow-up sentence.
+    
+    Final short paragraph.
+    """)
