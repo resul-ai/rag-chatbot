@@ -58,7 +58,8 @@ cd rag-chatbot
 
 2. Start the application using Docker Compose:
 ```bash
-docker-compose up --build
+docker compose up --build
+docker compose exec ollama ollama pull llama3.2
 ```
 
 3. Access the web interface:
